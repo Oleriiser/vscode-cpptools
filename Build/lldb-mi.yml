@@ -1,11 +1,11 @@
 variables:
   llvm_repo: https://github.com/llvm/llvm-project.git
-  llvm_branch: tags/llvmorg-9.0.1
+  llvm_branch: release/10.x
   llvm_build_type: Release
   llvm_arch: x86_64
   llvm_additional_parameters: "-DLLDB_RELOCATABLE_PYTHON=1 -DLLDB_INCLUDE_TESTS=OFF -DLLDB_BUILD_FRAMEWORK=1"
-  lldb_mi_repo: https://github.com/lldb-tools/lldb-mi
-  lldb_mi_branch: origin/master
+  lldb_mi_repo: https://github.com/WardenGnaw/lldb-mi
+  lldb_mi_branch: dev/waan/addFrameworkBuild
   lldb_mi_additional_parameters: "-DUSE_LLDB_FRAMEWORK=1"
 
 jobs:
@@ -24,40 +24,48 @@ jobs:
     displayName: 'Build LLVM Project'
     inputs: 
       script: |
-        cd $(Build.StagingDirectory)
-        mkdir $(Build.StagingDirectory)/buildspace
+        log_and_exec_cmd() {
+          echo "##[command] $1"
+          $1
+        }
+
+        log_and_exec_cmd "cd $(Build.StagingDirectory)"
+        log_and_exec_cmd "mkdir $(Build.StagingDirectory)/buildspace"
         
-        git clone $(llvm_repo)
-        cd llvm-project
-        git checkout $(llvm_branch)
+        log_and_exec_cmd "git clone $(llvm_repo)"
+        log_and_exec_cmd "cd llvm-project"
+        log_and_exec_cmd "git checkout $(llvm_branch)"
 
-        echo "##[command] ./lldb/scripts/macos-setup-codesign.sh"
+        log_and_exec_cmd "./lldb/scripts/macos-setup-codesign.sh"
 
-        ./lldb/scripts/macos-setup-codesign.sh
+        log_and_exec_cmd "cd .."
+        log_and_exec_cmd "mkdir $(Build.StagingDirectory)/buildspace/llvm-inst"
+        log_and_exec_cmd "mkdir $(Build.StagingDirectory)/buildspace/llvm-build"
+        log_and_exec_cmd "cd $(Build.StagingDirectory)/buildspace/llvm-build"
 
-        cd ..
-        mkdir $(Build.StagingDirectory)/buildspace/llvm-inst
-        mkdir $(Build.StagingDirectory)/llvm-build
-        cd $(Build.StagingDirectory)/llvm-build
-
-        cmake -DLLVM_ENABLE_PROJECTS="clang;lldb" -DCMAKE_BUILD_TYPE=$(llvm_build_type) -DCMAKE_INSTALL_PREFIX=$(Build.StagingDirectory)/buildspace/llvm-inst/ -DCMAKE_OSX_ARCHITECTURES=$(llvm_arch) $(llvm_additional_parameters) -GNinja $(Build.StagingDirectory)/llvm-project/llvm
+        log_and_exec_cmd "cmake -DLLVM_ENABLE_PROJECTS=clang;lldb -DCMAKE_BUILD_TYPE=$(llvm_build_type) -DCMAKE_INSTALL_PREFIX=$(Build.StagingDirectory)/buildspace/llvm-inst/ -DCMAKE_OSX_ARCHITECTURES=$(llvm_arch) $(llvm_additional_parameters) -GNinja $(Build.StagingDirectory)/llvm-project/llvm"
         if [[ $? -ne 0 ]]
         then
           echo "##[error] cmake llvm failed"
-          cat $(Build.SourcesDirectory)/llvm-build/CMakeFiles/CMakeError.log
+          cat $(Build.SourcesDirectory)/buildspace/llvm-build/CMakeFiles/CMakeError.log
           exit 1
         fi
 
-        echo "##[command] ninja"
-        ninja
+        log_and_exec_cmd ninja
         if [[ $? -ne 0 ]]
         then
           echo "##[error] ninja failed"
           exit 1
         fi
 
-        echo "##[command] ninja install"
-        ninja install
+        log_and_exec_cmd "ninja install" # this install will fail.
+
+        # Workaround to build lldb/sources/API first
+        log_and_exec_cmd "rm -rf $(Build.StagingDirectory)/buildspace/llvm-inst/Library/Frameworks/LLDB.framework"
+
+        log_and_exec_cmd "cmake -P $(Build.StagingDirectory)/buildspace/llvm-build/tools/lldb/source/API/cmake_install.cmake"
+
+        log_and_exec_cmd "ninja install"
         if [[ $? -ne 0 ]]
         then
           echo "##[error] ninja install failed"
@@ -66,53 +74,29 @@ jobs:
 
         echo "##[section] Build LLDB-MI"
         # Download lldb-mi and build it against our custom installation.
-        cd $(Build.StagingDirectory)/buildspace
-        git clone $(lldb_mi_repo)
-        cd lldb-mi
-        git checkout $(lldb_mi_branch)
+        log_and_exec_cmd "cd $(Build.StagingDirectory)/buildspace"
+        log_and_exec_cmd "git clone $(lldb_mi_repo)"
+        log_and_exec_cmd "cd lldb-mi"
+        log_and_exec_cmd "git checkout $(lldb_mi_branch)"
 
         # Create a separate build directory for building lldb-mi.
-        mkdir build
-        cd build
-        cmake -DCMAKE_PREFIX_PATH=$(Build.StagingDirectory)/buildspace/llvm-inst/ $(lldb_mi_additional_parameters) -GNinja ..
-        ninja
+        log_and_exec_cmd "mkdir build"
+        log_and_exec_cmd "cd build"
+        log_and_exec_cmd "cmake -DCMAKE_PREFIX_PATH=$(Build.StagingDirectory)/buildspace/llvm-inst/ $(lldb_mi_additional_parameters) -GNinja .."
+        log_and_exec_cmd "ninja"
 
-        mkdir $(Build.StagingDirectory)/publish
-        cd $(Build.StagingDirectory)/publish
+        log_and_exec_cmd "mkdir $(Build.StagingDirectory)/publish"
+        log_and_exec_cmd "cd $(Build.StagingDirectory)/publish"
 
-        mkdir bin
+        log_and_exec_cmd "mkdir bin"
 
-        cp $(Build.StagingDirectory)/buildspace/lldb-mi/build/src/lldb-mi ./bin/.
+        log_and_exec_cmd "cp $(Build.StagingDirectory)/buildspace/lldb-mi/build/src/lldb-mi ./bin/."
 
         # Set rpath for dylib
-        install_name_tool -add_rpath @rpath/LLDB.framework/Versions/A/LLDB ./bin/lldb-mi
+        log_and_exec_cmd "install_name_tool -add_rpath @rpath/LLDB.framework/Versions/A/LLDB ./bin/lldb-mi"
 
   - task: PublishPipelineArtifact@1
     displayName: 'Publish LLDB-MI'
     inputs:
       targetPath: '$(Build.StagingDirectory)/publish/bin/lldb-mi'
       artifactName: 'lldb-mi'
-
-# - job: SignFiles
-#   dependsOn: LLDB_MI
-#   pool:
-#     name: 'MicroBuildV2Pool'
-#   steps:
-#   - task: DownloadPipelineArtifact@2
-#     inputs:
-#       source: 'current'
-#       artifact: 'lldb-mi'
-#       path: '$(Pipeline.Workspace)/signing'
-
-#   - task: ms-vseng.MicroBuildTasks.7973a23b-33e3-4b00-a7d9-c06d90f8297f.MicroBuildSignMacFiles@1
-#     inputs:
-#       SigningTarget: '$(Pipeline.Workspace)/signing/lldb-mi.zip'
-#       SigningCert: '8003'
-#       SigningPluginSource: 'https://devdiv.pkgs.visualstudio.com/DefaultCollection/_packaging/MicroBuildToolset/nuget/v3/index.json'
-#       SigningPluginVersion: 'latest'
-
-#   - task: PublishPipelineArtifact@1
-#     displayName: 'Publish LLDB-MI'
-#     inputs:
-#       targetPath: '$(Pipeline.Workspace)/signing/lldb-mi.zip'
-#       artifactName: 'lldb-mi-signed'
